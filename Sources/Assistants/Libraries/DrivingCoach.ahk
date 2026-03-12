@@ -682,7 +682,8 @@ class DrivingCoach extends GridRaceAssistant {
 					throw "Empty model detected in DrivingCoach.startConversation..."
 				else if (service[1] = "LLM Runtime")
 					this.iConnector := LLMConnector.LLMRuntimeConnector(this, this.Options["Driving Coach.Model"]
-																			, this.Options["Driving Coach.GPULayers"])
+																			, this.Options["Driving Coach.GPULayers"]
+																			, this.Options.Get("Driving Coach.ToolCallFormat", ""))
 				else {
 					this.iConnector := LLMConnector.%StrReplace(service[1], A_Space, "")%Connector(this, this.Options["Driving Coach.Model"])
 

@@ -818,8 +818,12 @@ class LLMConnector {
 	}
 
 	class LLMRuntimeConnector extends LLMConnector {
+		static kToolCallsPrefix := "<|tool_calls|>"
+		static kToolNameSeparator := "<|tool_name|>"
+
 		iLLMRuntime := false
 		iGPULayers := 0
+		iToolFormat := ""
 
 		LLMRuntime {
 			Get {
@@ -837,8 +841,19 @@ class LLMConnector {
 			}
 		}
 
-		__New(manager, model, gpuLayers := 0) {
+		ToolFormat {
+			Get {
+				return this.iToolFormat
+			}
+
+			Set {
+				return (this.iToolFormat := value)
+			}
+		}
+
+		__New(manager, model, gpuLayers := 0, toolFormat := "") {
 			this.iGPULayers := gpuLayers
+			this.iToolFormat := toolFormat
 
 			super.__New(manager, model)
 
@@ -865,7 +880,7 @@ class LLMConnector {
 						deleteFile(kTempDirectory . "LLMRuntime.cmd")
 						deleteFile(kTempDirectory . "LLMRuntime.out")
 
-						options := ("`"" . this.Model . "`" " . this.Temperature . A_Space . this.MaxTokens . A_Space . this.GPULayers)
+						options := ("`"" . this.Model . "`" " . this.Temperature . A_Space . this.MaxTokens . A_Space . this.GPULayers . A_Space . this.ToolFormat)
 
 						Run("`"" . exePath . "`" `"" . kTempDirectory . "LLMRuntime.cmd`" `"" . kTempDirectory . "LLMRuntime.out`" " . options, kBinariesDirectory, "Hide", &llmRuntime)
 
@@ -913,7 +928,7 @@ class LLMConnector {
 			return false
 		}
 
-		CreatePrompt(instructions, tools, question) {
+		CreatePrompt(instructions, tools, question, toolResults := false) {
 			local prompt := ""
 			local ignore, instruction, conversation
 
@@ -928,9 +943,22 @@ class LLMConnector {
 
 			do(instructions, addInstruction)
 
+			if (tools && (tools.Length > 0) && (this.ToolFormat != "")) {
+				local toolDescriptors := collect(tools, (t) => t.Descriptor)
+
+				prompt .= ("<|### Tools ###|>`n" . JSON.print(toolDescriptors) . "`n")
+			}
+
 			for ignore, conversation in (this.History ? this.History : []) {
 				prompt .= ("<|### User ###|>`n" . conversation[1] . "`n")
 				prompt .= ("<|### Assistant ###|>`n" . conversation[2] . "`n")
+			}
+
+			if (toolResults && (toolResults.Length > 0)) {
+				local ignore2, toolResult
+
+				for ignore2, toolResult in toolResults
+					prompt .= ("<|### Tool ###|>`n" . LLMRuntimeConnector.kToolNameSeparator . toolResult[1] . "`n" . toolResult[2] . "`n")
 			}
 
 			prompt .= ("<|### User ###|>`n" . question)
@@ -939,16 +967,140 @@ class LLMConnector {
 		}
 
 		ProcessToolCalls(tools, message, &calls?) {
+			if !InStr(message, LLMRuntimeConnector.kToolCallsPrefix)
+				return false
+
+			local jsonStr := SubStr(message, StrLen(LLMRuntimeConnector.kToolCallsPrefix) + 1)
+
+			try {
+				local parsed := JSON.parse(jsonStr)
+
+				if !isInstance(parsed, Array)
+					return false
+
+				if isSet(calls)
+					calls := choose(collect(parsed, ObjBindMethod(this, "CallTool", tools)), (v) => !!v)
+				else
+					do(parsed, ObjBindMethod(this, "CallTool", tools))
+
+				return true
+			}
+			catch Any as exception {
+				logError(exception)
+
+				return false
+			}
+		}
+
+		FindTool(tools, name) {
+			local ignore, candidate
+
+			for ignore, candidate in tools
+				if (candidate.Name = name)
+					return candidate
+
 			return false
+		}
+
+		CallTool(tools, tool) {
+			local name, arguments
+
+			getArguments(function, arguments) {
+				local result := []
+				local ignore, parameter, name, argument, value
+
+				for ignore, parameter in function.Parameters {
+					value := kUndefined
+
+					for name, argument in arguments
+						if (name = parameter.Name) {
+							value := parameter.Reader.Call(argument)
+
+							break
+						}
+
+					result.Push((value = kUndefined) ? unset : value)
+				}
+
+				return result
+			}
+
+			if tool.Has("function") {
+				tool := tool["function"]
+				arguments := tool["arguments"]
+
+				local found := this.FindTool(tools, tool["name"])
+
+				if found {
+					if isInstance(arguments, String)
+						arguments := JSON.parse(arguments)
+
+					arguments := getArguments(found, toMap(arguments))
+
+					found.Callable.Call(arguments*)
+
+					return Array(found, arguments)
+				}
+				else
+					return false
+			}
+			else
+				return false
 		}
 
 		ParseAnswer(answer) {
 			return StrReplace(StrReplace(StrReplace(super.ParseAnswer(answer), "System:", ""), "Assistant:", ""), "User:", "")
 		}
 
+		SendPrompt(prompt) {
+			while !deleteFile(kTempDirectory . "LLMRuntime.cmd")
+				Sleep(50)
+
+			while !deleteFile(kTempDirectory . "LLMRuntime.out")
+				Sleep(50)
+
+			loop 5
+				try {
+					FileAppend(prompt, kTempDirectory . "LLMRuntime.cmd")
+
+					break
+				}
+				catch Any as exception {
+					if (A_Index = 5)
+						logError(exception, true)
+					else
+						Sleep(10)
+				}
+
+			loop (isDebug() ? 240 : 120)
+				try
+					if FileExist(kTempDirectory . "LLMRuntime.out") {
+						Sleep(500)
+
+						break
+					}
+					else
+						Sleep(1000)
+		}
+
+		ReadAnswer() {
+			local answer
+
+			if !FileExist(kTempDirectory . "LLMRuntime.out")
+				return false
+
+			answer := FileRead(kTempDirectory . "LLMRuntime.out", "`n")
+
+			deleteFile(kTempDirectory . "LLMRuntime.out")
+
+			while ((StrLen(answer) > 0) && (SubStr(answer, 1, 1) = "`n"))
+				answer := SubStr(answer, 2)
+
+			return (Trim(answer) = "Error") ? false : answer
+		}
+
 		Ask(question, instructions := false, tools := false, &calls?) {
-			local toolCall := false
-			local command, prompt, answer
+			local prompt, answer, toolCall
 
 			if !this.Connect() {
 				this.Manager.connectorState("Error", "Connection")
@@ -956,9 +1108,14 @@ class LLMConnector {
 				return false
 			}
 
+			if !instructions
+				instructions := this.GetInstructions()
+
+			if !tools
+				tools := this.GetTools()
+
 			try {
-				prompt := this.CreatePrompt(instructions ? instructions : this.GetInstructions()
-										  , tools ? tools : this.GetTools(), question)
+				prompt := this.CreatePrompt(instructions, tools, question)
 
 				if isDebug() {
 					deleteFile(kTempDirectory . "LLM.request")
@@ -967,36 +1124,7 @@ class LLMConnector {
 						FileAppend(prompt, kTempDirectory . "LLM.request")
 				}
 
-				; prompt := StrReplace(StrReplace(prompt, "`"", "\`""), "`n", "\n")
-
-				while !deleteFile(kTempDirectory . "LLMRuntime.cmd")
-					Sleep(50)
-
-				while !deleteFile(kTempDirectory . "LLMRuntime.out")
-					Sleep(50)
-
-				loop 5
-					try {
-						FileAppend(prompt, kTempDirectory . "LLMRuntime.cmd")
-
-						break
-					}
-					catch Any as exception {
-						if (A_Index = 5)
-							logError(exception, true)
-						else
-							Sleep(10)
-					}
-
-				loop (isDebug() ? 240 : 120)
-					try
-						if FileExist(kTempDirectory . "LLMRuntime.out") {
-							Sleep(500)
-
-							break
-						}
-						else
-							Sleep(1000)
+				this.SendPrompt(prompt)
 			}
 			catch Any as exception {
 				logError(exception, true)
@@ -1007,46 +1135,38 @@ class LLMConnector {
 			}
 
 			try {
-				if !FileExist(kTempDirectory . "LLMRuntime.out") {
+				answer := this.ReadAnswer()
+
+				if !answer {
 					this.Manager.connectorState("Error", "Answer")
 
 					return false
 				}
 
-				answer := FileRead(kTempDirectory . "LLMRuntime.out", "`n")
+				this.Manager.connectorState("Active")
 
-				while ((StrLen(answer) > 0) && (SubStr(answer, 1, 1) = "`n"))
-					answer := SubStr(answer, 2)
-
-				if (Trim(answer) = "Error")
-					answer := false
-				else {
-					this.Manager.connectorState("Active")
-
+				if InStr(answer, LLMRuntimeConnector.kToolCallsPrefix) {
 					if isSet(calls)
 						toolCall := this.ProcessToolCalls(tools, answer, &calls)
 					else
 						toolCall := this.ProcessToolCalls(tools, answer)
 
-					deleteFile(kTempDirectory . "LLMRuntime.out")
-
 					if toolCall
 						return true
-					else {
-						answer := this.ParseAnswer(answer)
-
-						if isDebug() {
-							deleteFile(kTempDirectory . "LLM.response")
-
-							try
-								FileAppend(answer, kTempDirectory . "LLM.response")
-						}
-
-						this.AddConversation(question, answer)
-
-						return answer
-					}
 				}
+
+				answer := this.ParseAnswer(answer)
+
+				if isDebug() {
+					deleteFile(kTempDirectory . "LLM.response")
+
+					try
+						FileAppend(answer, kTempDirectory . "LLM.response")
+				}
+
+				this.AddConversation(question, answer)
+
+				return answer
 			}
 			catch Any as exception {
 				logError(exception, true)

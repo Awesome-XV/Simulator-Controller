@@ -104,7 +104,7 @@ class LLMBooster extends ConfigurationItem {
 				throw "Unsupported service detected in LLMBooster.startBooster..."
 
 			if (service[1] = "LLM Runtime")
-				this.iConnector := LLMConnector.LLMRuntimeConnector(this, this.Options["Model"], this.Options["GPULayers"])
+				this.iConnector := LLMConnector.LLMRuntimeConnector(this, this.Options["Model"], this.Options["GPULayers"], this.Options.Get("ToolCallFormat", ""))
 			else
 				try {
 					this.iConnector := LLMConnector.%StrReplace(service[1], A_Space, "")%Connector(this, this.Options["Model"])
